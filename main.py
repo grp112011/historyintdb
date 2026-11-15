@@ -1,3 +1,5 @@
+import html
+import random
 import re
 import sqlite3
 import sys
@@ -8,6 +10,7 @@ from PyQt6.QtCore import QEvent, QPoint, QTimer, Qt
 from PyQt6.QtGui import QCursor, QGuiApplication
 from PyQt6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -16,6 +19,8 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QRadioButton,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
@@ -37,6 +42,28 @@ HTML_PREVIEW_COLUMNS = {
     "подробности",
 }
 HTML_TAG_RE = re.compile(r"</?[a-zA-Z][^>]*>")
+
+QUIZ_QUESTION_COUNT = 10
+QUIZ_OPTION_COUNT = 4
+QUIZ_MAX_ANSWER_LENGTH = 120
+QUIZ_MAX_CLUE_LENGTH = 320
+QUIZ_RICH_CLUE_LENGTH = 40
+QUIZ_CLUE_COLUMNS_MIN = 2
+QUIZ_CLUE_COLUMNS_MAX = 3
+QUIZ_MAX_QUESTION_ATTEMPTS = QUIZ_QUESTION_COUNT * 100
+QUIZ_COLUMN_TEMPLATES = {
+    "name": "О ком или о чём идёт речь?",
+    "full name": "Каково полное имя этой личности?",
+    "born date": "Когда родился этот человек?",
+    "death date": "Когда умер этот человек?",
+    "information": "Выберите правильное описание.",
+    "begin date": "Когда началось это событие?",
+    "end date": "Когда завершилось это событие?",
+    "side 2": "Какая сторона указана второй?",
+    "result": "Каков итог этого события?",
+    "course": "Как проходило это событие?",
+}
+QUIZ_EXCLUDED_ANSWER_COLUMNS = {"side 1"}
 
 
 class HtmlPreviewPopup(QFrame):
@@ -100,6 +127,445 @@ class HtmlPreviewPopup(QFrame):
         self.move(x, y)
         self.show()
         self.raise_()
+
+
+class KnowledgeQuiz(QWidget):
+    def __init__(self, connection: sqlite3.Connection, parent=None) -> None:
+        super().__init__(parent)
+        self.connection = connection
+        self.questions: list[dict] = []
+        self.current_index = 0
+        self.score = 0
+        self.answered = False
+
+        self.progress_label = QLabel()
+        self.progress_label.setStyleSheet("color: #5f6368; font-size: 13px;")
+
+        self.question_label = QLabel()
+        self.question_label.setWordWrap(True)
+        self.question_label.setTextFormat(Qt.TextFormat.RichText)
+        self.question_label.setAlignment(
+            Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft
+        )
+        self.question_label.setStyleSheet(
+            "QLabel { font-size: 15px; color: #202124; }"
+        )
+
+        self.options_widget = QWidget()
+        self.options_layout = QVBoxLayout(self.options_widget)
+        self.options_layout.setContentsMargins(0, 8, 0, 8)
+        self.options_layout.setSpacing(6)
+
+        self.option_group = QButtonGroup(self)
+        self.option_group.setExclusive(True)
+
+        self.feedback_label = QLabel()
+        self.feedback_label.setWordWrap(True)
+        self.feedback_label.setMinimumHeight(24)
+
+        self.answer_button = QPushButton("Ответить")
+        self.answer_button.clicked.connect(self.check_answer)
+
+        self.next_button = QPushButton("Следующий вопрос")
+        self.next_button.clicked.connect(self.go_next)
+
+        self.restart_button = QPushButton("Начать заново")
+        self.restart_button.clicked.connect(self.start_quiz)
+
+        buttons = QHBoxLayout()
+        buttons.addWidget(self.answer_button)
+        buttons.addWidget(self.next_button)
+        buttons.addWidget(self.restart_button)
+        buttons.addStretch()
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.addWidget(self.progress_label)
+        layout.addWidget(self.question_label)
+        layout.addWidget(self.options_widget)
+        layout.addWidget(self.feedback_label)
+        layout.addLayout(buttons)
+        layout.addStretch()
+
+        self.start_quiz()
+
+    def start_quiz(self) -> None:
+        self.questions = self.build_questions()
+        self.current_index = 0
+        self.score = 0
+        self.answered = False
+
+        if not self.questions:
+            self.progress_label.setText("Тест недоступен")
+            self.question_label.setText(
+                "Не удалось составить вопросы: в базе недостаточно данных."
+            )
+            self.options_widget.hide()
+            self.feedback_label.hide()
+            self.answer_button.hide()
+            self.next_button.hide()
+            self.restart_button.show()
+            return
+
+        self.options_widget.show()
+        self.feedback_label.show()
+        self.restart_button.show()
+        self.show_question()
+
+    def build_questions(self) -> list[dict]:
+        schemas = self.load_schemas()
+        if not schemas:
+            return []
+
+        questions = []
+        used = set()
+        attempts = 0
+        while (
+            len(questions) < QUIZ_QUESTION_COUNT
+            and attempts < QUIZ_MAX_QUESTION_ATTEMPTS
+        ):
+            attempts += 1
+            question = self.make_question(schemas)
+            if question is None:
+                continue
+
+            key = (
+                question["table"],
+                question["answer_column"],
+                question["correct"],
+            )
+            if key in used:
+                continue
+
+            used.add(key)
+            questions.append(question)
+
+        return questions
+
+    def load_schemas(self) -> list[dict]:
+        schemas = []
+        try:
+            cursor = self.connection.cursor()
+            tables = cursor.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+                "ORDER BY name"
+            ).fetchall()
+
+            for (table_name,) in tables:
+                info = cursor.execute(
+                    f"PRAGMA table_info({self.quote_identifier(table_name)})"
+                ).fetchall()
+                columns = [row[1] for row in info]
+                if not columns:
+                    continue
+
+                rows = cursor.execute(
+                    f"SELECT * FROM {self.quote_identifier(table_name)}"
+                ).fetchall()
+                if len(rows) < QUIZ_OPTION_COUNT:
+                    continue
+
+                schemas.append(
+                    {
+                        "table": table_name,
+                        "columns": columns,
+                        "primary_keys": {
+                            row[1] for row in info if row[5]
+                        },
+                        "records": [
+                            dict(zip(columns, row)) for row in rows
+                        ],
+                    }
+                )
+        except sqlite3.Error:
+            return []
+
+        return schemas
+
+    def make_question(self, schemas: list[dict]) -> dict | None:
+        schema = random.choice(schemas)
+        records = schema["records"]
+        answer_columns = []
+
+        for column in schema["columns"]:
+            if (
+                column in schema["primary_keys"]
+                or column in QUIZ_EXCLUDED_ANSWER_COLUMNS
+            ):
+                continue
+            values = [
+                value
+                for record in records
+                if (value := self.answer_text(record.get(column)))
+            ]
+            if len(set(values)) < QUIZ_OPTION_COUNT:
+                continue
+            if max(len(value) for value in values) > QUIZ_MAX_ANSWER_LENGTH:
+                continue
+            answer_columns.append(column)
+
+        if not answer_columns:
+            return None
+
+        answer_column = random.choice(answer_columns)
+        rows_with_answer = [
+            record
+            for record in records
+            if self.answer_text(record.get(answer_column))
+        ]
+        target = random.choice(rows_with_answer)
+        correct = self.answer_text(target.get(answer_column))
+
+        all_answers = list(
+            dict.fromkeys(
+                value
+                for record in records
+                if (value := self.answer_text(record.get(answer_column)))
+            )
+        )
+        distractors = [value for value in all_answers if value != correct]
+        if len(distractors) < QUIZ_OPTION_COUNT - 1:
+            return None
+
+        clue_candidates = []
+        for column in schema["columns"]:
+            if column == answer_column or column in schema["primary_keys"]:
+                continue
+            value = self.cell_text(target.get(column))
+            clue = self.clue_text(value)
+            if not clue or self.values_overlap(clue, correct):
+                continue
+            clue_candidates.append((column, clue))
+
+        if not clue_candidates:
+            return None
+
+        rich_clues = [
+            candidate
+            for candidate in clue_candidates
+            if len(candidate[1]) >= QUIZ_RICH_CLUE_LENGTH
+        ]
+        if rich_clues:
+            selected = [random.choice(rich_clues)]
+            remaining = [
+                candidate
+                for candidate in clue_candidates
+                if candidate[0] != selected[0][0]
+            ]
+            max_extra = min(QUIZ_CLUE_COLUMNS_MAX - 1, len(remaining))
+            extra_count = (
+                random.randint(1, max_extra) if max_extra else 0
+            )
+            selected.extend(random.sample(remaining, extra_count))
+        else:
+            min_count = min(QUIZ_CLUE_COLUMNS_MIN, len(clue_candidates))
+            max_count = min(QUIZ_CLUE_COLUMNS_MAX, len(clue_candidates))
+            selected = random.sample(
+                clue_candidates,
+                random.randint(min_count, max_count),
+            )
+
+        clue_columns = sorted(
+            (column for column, _ in selected),
+            key=schema["columns"].index,
+        )
+
+        question_text = self.build_question_text(
+            answer_column, clue_columns, target
+        )
+        visible_text = self.plain_text(question_text).casefold()
+        if correct.casefold() in visible_text:
+            return None
+
+        suitable = [
+            value for value in distractors if value.casefold() not in visible_text
+        ]
+        if len(suitable) < QUIZ_OPTION_COUNT - 1:
+            suitable = distractors
+
+        options = [correct]
+        options.extend(random.sample(suitable, QUIZ_OPTION_COUNT - 1))
+        random.shuffle(options)
+        return {
+            "table": schema["table"],
+            "answer_column": answer_column,
+            "text": question_text,
+            "options": options,
+            "correct": correct,
+        }
+
+    def build_question_text(
+        self,
+        answer_column: str,
+        clue_columns: list[str],
+        record: dict,
+    ) -> str:
+        facts = [
+            f"<li>{html.escape(self.clue_text(record.get(column)))}</li>"
+            for column in clue_columns
+        ]
+        template = QUIZ_COLUMN_TEMPLATES.get(
+            answer_column, "Определите правильное значение."
+        )
+        return (
+            f"<p><b>{html.escape(template)}</b></p>"
+            f"<ul>{''.join(facts)}</ul>"
+        )
+
+    @staticmethod
+    def quote_identifier(name: str) -> str:
+        return '"' + name.replace('"', '""') + '"'
+
+    @staticmethod
+    def cell_text(value) -> str:
+        return "" if value is None else str(value).strip()
+
+    def answer_text(self, value) -> str:
+        return self.format_date(self.cell_text(value))
+
+    @staticmethod
+    def plain_text(value) -> str:
+        if value is None:
+            return ""
+        text = html.unescape(re.sub(r"<[^>]+>", " ", str(value)))
+        return re.sub(r"\s+", " ", text).strip()
+
+    def clue_text(self, value) -> str:
+        text = self.plain_text(value)
+        if not text:
+            return ""
+
+        sentences = re.split(r"(?<=[.!?])\s+", text)
+        text = " ".join(sentences[:2]).strip()
+        if len(text) > QUIZ_MAX_CLUE_LENGTH:
+            text = text[:QUIZ_MAX_CLUE_LENGTH].rsplit(" ", 1)[0]
+            text = text.rstrip(" ,;:") + "…"
+        return self.format_date(text)
+
+    @staticmethod
+    def values_overlap(first: str, second: str) -> bool:
+        first_value = first.casefold().strip()
+        second_value = second.casefold().strip()
+        return bool(
+            first_value
+            and second_value
+            and (
+                first_value in second_value
+                or second_value in first_value
+            )
+        )
+
+    @staticmethod
+    def format_date(value) -> str:
+        text = "" if value is None else str(value).strip()
+        match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", text)
+        if match:
+            year, month, day = match.groups()
+            return f"{day}.{month}.{year}"
+        return text
+
+    def clear_options(self) -> None:
+        for button in self.option_group.buttons():
+            self.option_group.removeButton(button)
+        while self.options_layout.count():
+            item = self.options_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+
+    def show_question(self) -> None:
+        question = self.questions[self.current_index]
+        self.answered = False
+
+        self.progress_label.setText(
+            f"Вопрос {self.current_index + 1} из {len(self.questions)}"
+            f"   ·   Правильных ответов: {self.score}"
+        )
+        self.question_label.setText(question["text"])
+
+        self.clear_options()
+        for option in question["options"]:
+            button = QRadioButton(option)
+            button.setStyleSheet("font-size: 14px; padding: 2px 0;")
+            self.option_group.addButton(button)
+            self.options_layout.addWidget(button)
+
+        self.feedback_label.clear()
+        self.feedback_label.setStyleSheet("")
+        self.answer_button.show()
+        self.answer_button.setEnabled(True)
+        self.next_button.setText("Показать результат")
+        self.next_button.hide()
+
+    def check_answer(self) -> None:
+        if self.answered:
+            return
+
+        checked = self.option_group.checkedButton()
+        if checked is None:
+            self.feedback_label.setText("Сначала выберите вариант ответа.")
+            self.feedback_label.setStyleSheet("color: #8a6d3b;")
+            return
+
+        question = self.questions[self.current_index]
+        correct = question["correct"]
+        selected = checked.text()
+        self.answered = True
+
+        if selected == correct:
+            self.score += 1
+            self.feedback_label.setText("Верно!")
+            self.feedback_label.setStyleSheet(
+                "color: #1b7f3b; font-weight: bold;"
+            )
+        else:
+            self.feedback_label.setText(f"Неверно. Правильный ответ: {correct}")
+            self.feedback_label.setStyleSheet(
+                "color: #b3261e; font-weight: bold;"
+            )
+
+        for button in self.option_group.buttons():
+            button.setEnabled(False)
+            if button.text() == correct:
+                button.setStyleSheet(
+                    "font-size: 14px; padding: 2px 0;"
+                    " color: #1b7f3b; font-weight: bold;"
+                )
+            elif button is checked:
+                button.setStyleSheet(
+                    "font-size: 14px; padding: 2px 0; color: #b3261e;"
+                )
+
+        self.answer_button.hide()
+        self.next_button.setText(
+            "Показать результат"
+            if self.current_index == len(self.questions) - 1
+            else "Следующий вопрос"
+        )
+        self.next_button.show()
+
+    def go_next(self) -> None:
+        if self.current_index + 1 >= len(self.questions):
+            self.show_result()
+            return
+
+        self.current_index += 1
+        self.show_question()
+
+    def show_result(self) -> None:
+        total = len(self.questions)
+        self.progress_label.setText(f"Результат: {self.score} из {total}")
+        self.question_label.setText(
+            "<h2>Тест завершён</h2>"
+            f"<p>Правильных ответов: <b>{self.score} из {total}</b></p>"
+            "<p>Нажмите «Начать заново», чтобы пройти тест ещё раз.</p>"
+        )
+        self.options_widget.hide()
+        self.feedback_label.hide()
+        self.answer_button.hide()
+        self.next_button.hide()
+        self.restart_button.show()
 
 
 class App(QWidget):
@@ -182,10 +648,27 @@ class App(QWidget):
         top.addWidget(self.delete_row_button)
         top.addStretch()
 
+        table_page = QWidget()
+        table_page_layout = QVBoxLayout(table_page)
+        table_page_layout.setContentsMargins(0, 0, 0, 0)
+        table_page_layout.addLayout(top)
+        table_page_layout.addLayout(self.search_layout)
+        table_page_layout.addWidget(self.table, 1)
+
+        knowledge_page = QWidget()
+        knowledge_page_layout = QVBoxLayout(knowledge_page)
+        knowledge_page_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.quiz = KnowledgeQuiz(self.connection)
+        knowledge_page_layout.addWidget(self.quiz)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(table_page, "Таблица")
+        self.tabs.addTab(knowledge_page, "Проверка знаний")
+
         layout = QVBoxLayout(self)
-        layout.addLayout(top)
-        layout.addLayout(self.search_layout)
-        layout.addWidget(self.table, 1)
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.addWidget(self.tabs)
         if DEBUG_MODE:
             print(f'[DEBUG] base UI crated')
 
